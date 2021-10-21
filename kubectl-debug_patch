@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# defaults
+image="alpine:latest"
+debug_path="/opt/debug"
+
+# args handling
+while [[ $# -gt 0 ]]; do
+  key=$1
+  case $key in
+    --namespace|-n)
+      ns=$2
+      shift
+      shift
+      ;;
+    --image)
+      image=$2
+      shift
+      shift
+      ;;
+    --undo)
+      undo=1
+      shift
+      ;;
+    --debug-path)
+      debug_path=$2
+      shift
+      ;;
+    *)
+      if [ -z "${kind:-}" ]; then
+        kind=$1
+        shift
+        continue
+      fi
+      if [ -z "${name:-}" ]; then
+        name=$1
+        shift
+        continue
+      fi
+      echo "Invalid arg: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# check mandatory args
+if [ -z "$kind" ]; then
+  echo "No kind defined." >&2
+  exit 1
+fi
+if [ -z "$name" ]; then
+  echo "No resource name defined." >&2
+  exit 1
+fi
+
+
+generate_patch() {
+  kubectl get ${ns+-n $ns} "$kind" "$name" -o json |
+  jq \
+    --arg image "$image" \
+    --arg debug_path "$debug_path" \
+    '.spec.template.spec.containers as $old_containers |
+      {} | .spec.template.spec |= {
+        shareProcessNamespace: true,
+        containers: ($old_containers | map({
+            name,
+          }) + [{
+          name: "debug",
+          image: $image,
+          command: ["sh","-c"],
+          args: ["sleep infinity"],
+          env: [{
+            name: "DEBUG_PATH",
+            value: $debug_path,
+          }]
+        }]) | map(. + {
+          volumeMounts: [{
+            name: "debug",
+            mountPath: "/opt/debug",
+          }],
+        }),
+        volumes: [{
+          name: "debug",
+          emptyDir: {},
+        }],
+      }
+    '
+}
+
+
+generate_undo_patch() {
+  kubectl get ${ns+-n $ns} "$kind" "$name" -o json |
+  jq \
+    --arg image "$image" \
+    '.spec.template.spec.containers as $old_containers |
+      {} | .spec.template.spec |= {
+        shareProcessNamespace: null,
+        containers: ($old_containers | map(select(.name != "debug")|{
+            name,
+            volumeMounts: [{
+              "$patch": "delete",
+              mountPath: "/opt/debug"
+            }]
+          }) + [{
+            "$patch": "delete",
+            name: "debug",
+          }]),
+        volumes: [{
+          "$patch": "delete",
+          name: "debug",
+        }],
+      }
+    '
+}
+
+if [ -n "${undo:-}" ]; then
+  kubectl patch ${ns+-n $ns} "$kind" "$name" --type strategic --patch "$(generate_undo_patch)"
+else
+  kubectl patch ${ns+-n $ns} "$kind" "$name" --type strategic --patch "$(generate_patch)"
+fi
